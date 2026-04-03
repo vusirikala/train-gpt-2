@@ -19,6 +19,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANO_GPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -140,6 +141,14 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
+            # 0.02 is roughly in the order of sqrt(1/n_embd) and sqrt(1/3*n_embd)
+            std = 0.02
+
+            # We have 2 * n_layer residual connections in the transformer.
+            # This will increase the variance by a factor of sqrt(2 * n_layer).
+            # So, we divide by sqrt(2 * n_layer) to keep the variance constant.
+            if hasattr(module, 'NANO_GPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -252,7 +261,11 @@ class DataLoader:
 num_return_sequences = 5
 max_length = 30
 device = "mps" if torch.backends.mps.is_available() else "cpu"
-
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+if torch.backends.mps.is_available():
+    torch.mps.manual_seed(1337)
 # enc = tiktoken.get_encoding("gpt2")
 # with open('input.txt', 'r') as f:
 #     text = f.read()
@@ -268,27 +281,64 @@ device = "mps" if torch.backends.mps.is_available() else "cpu"
 # model = GPT.from_pretrained("gpt2")
 model = GPT(GPTConfig())
 model.to(device)
+
+# This is like gcc for PyTorch models.
+# There's no good reason not to use it.
+# It will speed up the model by a lot.
+# It will reduce Python overhead and reduce read writes.
+# Torch.compile will look at all the operations in the model and optimize them for the best performance.
+# CPU has RAM memory. GPU has HBM (High Bandwidth Memory).
+# Without the compilation, for every operation, the data is copied from HBM to GPU, and the result is copied back to HBM.
+# With the compilation, if another operation is done to the output of previous operation, the data is not transferred to HBM.
+# This compilation reduces the bandwidth usage between GPU and HBM.
+model = torch.compile(model)
 # logits, loss = model(x, y)
 
 # AdamW is a bug fix of Adam. It is a more stable version of Adam.
 # It is a more stable version of Adam.
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-train_loader = DataLoader(B = 4, T = 128)
+train_loader = DataLoader(B = 16, T = 1024)
+
+# Reducing the precision from "highest" to "high" to speed up the matrix multiplications.
+torch.set_float32_matmul_precision('high')
+
+import time
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x = x.to(device)
     y = y.to(device)
     # Always make sure to zero the gradients before backpropagation.
     optimizer.zero_grad()
-    # Forward pass
-    logits, loss = model(x, y)
+
+    # Using BFloat16 to speed up the matrix multiplications.
+    # If you use FP16 instead, you'll have to use gradient scalers.
+    # logits change to bfloat16. But model weights still remain at float32.
+    # Read documentation on automated mixed precision for more details.
+    # Matrix multiplications are more robust to precision changes.
+    # Lot of operations like layer norm normalization, softmax, log operations, etc. remain in float32. They are more susceptible to precision changes. 
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        # Forward pass
+        logits, loss = model(x, y)
+        # import code; code.interact(local=locals())
     # Backward pass
     loss.backward()
     # Update the parameters
     optimizer.step()
+
+    # CPU schedules work to GPUs and continues running.
+    # While GPU is running, CPU can continue running further instructions.
+    # To calculate the time taken in the loop accurately, we need to let the CPU wait for the GPU to finish its work.
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    if torch.backends.mps.is_available():
+        torch.mps.synchronize()
     # Print the loss
     # loss.item() takes the 1D tensor, ship it back to the CPU.
-    print(f"Step {i}, loss: {loss.item()}")
+    t1 = time.time()
+    dt = (t1- t0)*1000 # Time difference in milliseconds
+    tokens_per_second = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"Step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tokens/sec: {tokens_per_second:.2f}")
 
 
 import sys; sys.exit(0)
