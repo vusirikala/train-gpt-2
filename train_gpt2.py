@@ -69,21 +69,26 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # [B, n_head, T, hs]
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # [B, n_head, T, hs]
 
-        # attention materializes the large (T,T) matrix for all the queries and keys.
-        attn = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))
+        # Flash attention makes sure the the next 4 operations are done extremely faster -- 7.6x faster
+        # With flash attention technique, the attn value never gets materialized. It never gets read or written to HBM.
+        # This is an optimization even torch.compile doesn't do.
+                # # attention materializes the large (T,T) matrix for all the queries and keys.
+                # attn = (q @ k.transpose(-2, -1)) * (1 / math.sqrt(k.size(-1)))
 
-        # Apply the bias: :: means all indices from start to end
-        # This is to make sure the tokens only attend to previous tokens and never to the tokens in the future.
-        attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+                # # Apply the bias: :: means all indices from start to end
+                # # This is to make sure the tokens only attend to previous tokens and never to the tokens in the future.
+                # attn = attn.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
 
-        # softmax is a weight sum function.
-        # Normalizes the attention scores to sum to 1.
-        attn = F.softmax(attn, dim=-1)
+                # # softmax is a weight sum function.
+                # # Normalizes the attention scores to sum to 1.
+                # attn = F.softmax(attn, dim=-1)
 
-        # Attention matrix mulitply with the values. 
-        # This is a weighted sum of the values, weighted by the attention scores.
-        y = attn @ v # [B, n_head, T, T] * [B, n_head, T, hs] = [B, n_head, T, hs]
+                # # Attention matrix mulitply with the values. 
+                # # This is a weighted sum of the values, weighted by the attention scores.
+                # y = attn @ v # [B, n_head, T, T] * [B, n_head, T, hs] = [B, n_head, T, hs]
 
+        # Flash attention technique to perform the above 4 operations.
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # Reassable all the head output side by side. [B, n_head, T, hs] -> [B, T, n_head * hs]
         
         y = self.c_proj(y)
@@ -291,6 +296,10 @@ model.to(device)
 # Without the compilation, for every operation, the data is copied from HBM to GPU, and the result is copied back to HBM.
 # With the compilation, if another operation is done to the output of previous operation, the data is not transferred to HBM.
 # This compilation reduces the bandwidth usage between GPU and HBM.
+
+# CPU -- DRAM bandwidth (about 12.8 GB/s, > 1 TB storage)
+# GPU -- HBM bandwidth (about 2 TB/s, aboug 40 GB storage)
+# GPU -- SRAM bandwidth (about 19TB GB/s, about 20 MB storage)
 model = torch.compile(model)
 # logits, loss = model(x, y)
 
