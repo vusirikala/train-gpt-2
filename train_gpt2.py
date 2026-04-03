@@ -5,6 +5,7 @@ import math
 import tiktoken
 from torch.nn import functional as F
 import time
+import inspect
 
 
 @dataclass
@@ -237,6 +238,32 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
+    
+    # We are splitting the parameters that should be weight decayed and those that should not be weight decayed.
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # Create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e., all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for p in param_dict.values() if p.dim() >= 2]
+        nodecay_params = [p for p in param_dict.values() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decay parameter tensors: {num_decay_params}, num nodecay parameter tensors: {num_nodecay_params}")
+        
+        # Create AdamW optimizer anduse the fused version if it is available.
+        fused_availabled = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_availabled and 'cuda' in device
+        print(f"Using fused AdamW: {use_fused}")
+        
+        # Create AdamW optimizer and use the fused version if available.
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
 class DataLoader:
     def __init__(self, B, T):
@@ -309,7 +336,8 @@ model = torch.compile(model)
 
 # AdamW is a bug fix of Adam. It is a more stable version of Adam.
 # It is a more stable version of Adam.
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-8)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=1e-4, device=device)
 train_loader = DataLoader(B = 16, T = 1024)
 
 # Reducing the precision from "highest" to "high" to speed up the matrix multiplications.
