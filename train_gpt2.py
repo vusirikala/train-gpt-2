@@ -4,6 +4,8 @@ import torch.nn as nn
 import math
 import tiktoken
 from torch.nn import functional as F
+import time
+
 
 @dataclass
 class GPTConfig:
@@ -284,7 +286,9 @@ if torch.backends.mps.is_available():
 
 # get logits
 # model = GPT.from_pretrained("gpt2")
-model = GPT(GPTConfig())
+
+# Changing vocabulary size from 50257 to 50304, as 50304 is a multiple of 128. It's a nicer number.
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 
 # This is like gcc for PyTorch models.
@@ -305,14 +309,33 @@ model = torch.compile(model)
 
 # AdamW is a bug fix of Adam. It is a more stable version of Adam.
 # It is a more stable version of Adam.
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-8)
 train_loader = DataLoader(B = 16, T = 1024)
 
 # Reducing the precision from "highest" to "high" to speed up the matrix multiplications.
 torch.set_float32_matmul_precision('high')
 
-import time
-for i in range(50):
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # Linear warup for warmup_steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+
+    # After max_steps, reurn to min learning rate
+    if it > max_steps:
+        return min_lr
+
+    # In between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # Coeff starts at 1 and goes to 0.
+    return min_lr + coeff * (max_lr - min_lr)
+    
+
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x = x.to(device)
@@ -332,6 +355,14 @@ for i in range(50):
         # import code; code.interact(local=locals())
     # Backward pass
     loss.backward()
+
+    # Computes the global norm of the all parameters. Calculate sum of squares of all the gradients, and then clipping that number to 1.0.
+    # This is because, sometimes we get a bad outlier batch that creates a huge loss. This will shock the model with big gradients.
+    # Monitoring these norm values and checking if there are big shocks is a way good way to monitor the training process.
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=float('inf'))
+
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
     # Update the parameters
     optimizer.step()
 
@@ -347,7 +378,7 @@ for i in range(50):
     t1 = time.time()
     dt = (t1- t0)*1000 # Time difference in milliseconds
     tokens_per_second = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"Step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tokens/sec: {tokens_per_second:.2f}")
+    print(f"Step {step}, loss: {loss.item()}, dt: {dt:.2f}ms, norm: {norm:.2f}, lr: {lr:.2e}, tokens/sec: {tokens_per_second:.2f}")
 
 
 import sys; sys.exit(0)
