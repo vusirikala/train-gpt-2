@@ -125,8 +125,26 @@ class GPT(nn.Module):
             # ModuleList will allow you to iterate over the submodules like a list.
             # We can index into the submodules like a list 
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
         ))
-        self.llm_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+    
+    def forward(self, idx):
+        # Input is token indices of the input sentences.
+        # idx is [B, T] where each element is an integer representing a token ID.
+        B, T = idx.shape
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # [T]
+        pos_emb = self.transformer.wpe(pos) # [T, C]
+        tok_emb = self.transformer.wte(idx) # [B, T, C]
+        x = tok_emb + pos_emb
+        for block in self.transformer.h:
+            x = block(x)
+        # Forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # [B, T, vocab_size]
+        return logits
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -178,3 +196,11 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
+
+num_return_sequences = 5
+max_length = 30
+model = GPT.from_pretrained("gpt2")
+model.eval()
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+model.to(device)
+
