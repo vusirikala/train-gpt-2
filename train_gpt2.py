@@ -129,7 +129,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         # Input is token indices of the input sentences.
         # idx is [B, T] where each element is an integer representing a token ID.
         B, T = idx.shape
@@ -144,7 +144,15 @@ class GPT(nn.Module):
         # Forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # [B, T, vocab_size]
-        return logits
+
+        loss = None
+        if targets is not None:
+            # Flatting logits from (B, T, vocab_size) to (B * T, vocab_size)
+            # Flatting targets from (B, T) to (B * T, )
+            # This is because cross entropy doesn't like multi-dimensional targets.
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -199,14 +207,49 @@ class GPT(nn.Module):
 
 num_return_sequences = 5
 max_length = 30
-model = GPT.from_pretrained("gpt2")
-model.eval()
 device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+import tiktoken
+import torch
+enc = tiktoken.get_encoding("gpt2")
+with open('input.txt', 'r') as f:
+    text = f.read()
+tokens = enc.encode(text)
+B, T = 4, 32 # batch size, sequence length
+buf = torch.tensor(tokens[:B * T + 1])
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+# get logits
+# model = GPT.from_pretrained("gpt2")
+model = GPT(GPTConfig())
 model.to(device)
+x = x.to(device)
+y = y.to(device)
+logits, loss = model(x, y)
+
+# AdamW is a bug fix of Adam. It is a more stable version of Adam.
+# It is a more stable version of Adam.
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    # Always make sure to zero the gradients before backpropagation.
+    optimizer.zero_grad()
+    # Forward pass
+    logits, loss = model(x, y)
+    # Backward pass
+    loss.backward()
+    # Update the parameters
+    optimizer.step()
+    # Print the loss
+    # loss.item() takes the 1D tensor, ship it back to the CPU.
+    print(f"Step {i}, loss: {loss.item()}")
+
+
+import sys; sys.exit(0)
+
 
 # prefix tokens
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
+model.eval()
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # [num_return_sequences, 8]
@@ -216,7 +259,7 @@ torch.manual_seed(42)
 while x.size(1) < max_length:
     # forward the model to get the logits
     with torch.no_grad(): # Tells that we don't need to compute the gradients
-        logits = model(x) # [num_return_sequences, x.size(1), vocab_size]
+        logits, _ = model(x) # [num_return_sequences, x.size(1), vocab_size]
 
         # We only care about the logits for the last token
         logits = logits[:, -1, :] # [num_return_sequences, vocab_size]
