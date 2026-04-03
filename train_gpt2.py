@@ -204,3 +204,41 @@ model.eval()
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 model.to(device)
 
+# prefix tokens
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # [num_return_sequences, 8]
+x = tokens.to(device)
+
+torch.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get the logits
+    with torch.no_grad(): # Tells that we don't need to compute the gradients
+        logits = model(x) # [num_return_sequences, x.size(1), vocab_size]
+
+        # We only care about the logits for the last token
+        logits = logits[:, -1, :] # [num_return_sequences, vocab_size]
+
+        # get the probabilties
+        probs = F.softmax(logits, dim=-1) # [num_return_sequences, vocab_size]
+
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # tpok_probs here becomes (num_return_sequences, 50). topk_indices becomes (num_return_sequences, 50).
+        topk_probs, topk_indices = torch.topk(probs, k=50, dim=-1)
+
+        # select a token from the top-k probabilities
+        ix = torch.multinomial(topk_probs, num_samples=1) # [num_return_sequences, 1]
+
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # [num_return_sequences, 1]
+
+        # append to the sequence
+        x = torch.cat([x, xcol], dim=1) # [num_return_sequences, x.size(1) + 1]
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
