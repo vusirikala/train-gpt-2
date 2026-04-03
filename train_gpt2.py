@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import math
+import tiktoken
 from torch.nn import functional as F
 
 @dataclass
@@ -128,7 +129,23 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-    
+
+        # weight sharing scheme
+        # This copies the data pointer. The old value of wte.weight gets orphaned and garbage collected. 
+        # The new value of wte.weight is the same as the new value of lm_head.weight.
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         # Input is token indices of the input sentences.
         # idx is [B, T] where each element is an integer representing a token ID.
@@ -205,33 +222,62 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model
 
+class DataLoader:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"Loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position + B * T + 1]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B * T
+
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
 num_return_sequences = 5
 max_length = 30
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-import tiktoken
-import torch
-enc = tiktoken.get_encoding("gpt2")
-with open('input.txt', 'r') as f:
-    text = f.read()
-tokens = enc.encode(text)
-B, T = 4, 32 # batch size, sequence length
-buf = torch.tensor(tokens[:B * T + 1])
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+# enc = tiktoken.get_encoding("gpt2")
+# with open('input.txt', 'r') as f:
+#     text = f.read()
+# tokens = enc.encode(text)
+# B, T = 4, 32 # batch size, sequence length
+# buf = torch.tensor(tokens[:B * T + 1])
+# x = buf[:-1].view(B, T)
+# y = buf[1:].view(B, T)
+# x = x.to(device)
+# y = y.to(device)
 
 # get logits
 # model = GPT.from_pretrained("gpt2")
 model = GPT(GPTConfig())
 model.to(device)
-x = x.to(device)
-y = y.to(device)
-logits, loss = model(x, y)
+# logits, loss = model(x, y)
 
 # AdamW is a bug fix of Adam. It is a more stable version of Adam.
 # It is a more stable version of Adam.
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+train_loader = DataLoader(B = 4, T = 128)
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x = x.to(device)
+    y = y.to(device)
     # Always make sure to zero the gradients before backpropagation.
     optimizer.zero_grad()
     # Forward pass
